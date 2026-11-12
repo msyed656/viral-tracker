@@ -1,0 +1,49 @@
+name: track
+# One reading, then this run starts the next one at the next quarter hour (self-chaining, so it does not depend on
+# GitHub's best-effort cron). The cron below only restarts the chain if it ever breaks.
+on:
+  workflow_dispatch: {}
+  schedule: [{ cron: '*/15 * * * *' }]
+permissions: { contents: write, actions: write }
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env: { GH_TOKEN: '${{ github.token }}', REPO: '${{ github.repository }}' }
+    steps:
+      - name: Skip if another reading started in the last 10 minutes
+        id: guard
+        run: |
+          n=$(gh run list -R "$REPO" -w track.yml -L 10 --json databaseId,createdAt,status -q "[.[] | select(.databaseId != ${{ github.run_id }}) | select((now - (.createdAt | fromdateiso8601)) < 600)] | length")
+          echo "recent=$n" >> "$GITHUB_OUTPUT"; echo "other recent runs: $n"
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.recent == '0'
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.recent == '0'
+        with: { node-version: 24 }
+      - name: Load last state
+        if: steps.guard.outputs.recent == '0'
+        run: git fetch --depth=1 origin viral-data && git show origin/viral-data:state.json > state.json || echo "first run"
+      - name: Take a reading
+        if: steps.guard.outputs.recent == '0'
+        env:
+          STATE: state.json
+          YOUTUBE_OAUTH_CLIENT_ID: ${{ secrets.YOUTUBE_OAUTH_CLIENT_ID }}
+          YOUTUBE_OAUTH_CLIENT_SECRET: ${{ secrets.YOUTUBE_OAUTH_CLIENT_SECRET }}
+          YOUTUBE_OAUTH_REFRESH_TOKEN: ${{ secrets.YOUTUBE_OAUTH_REFRESH_TOKEN }}
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+        run: node --dns-result-order=ipv4first track.mjs
+      - name: Save state
+        if: steps.guard.outputs.recent == '0'
+        run: |
+          mkdir /tmp/out && mv state.json /tmp/out/ && cd /tmp/out
+          git init -q -b viral-data && git add state.json
+          git -c user.name=viral-tracker -c user.email=viral-tracker@users.noreply.github.com commit -qm "reading $(date -u +%FT%TZ)"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" viral-data
+      - name: Start the next reading at the next quarter hour
+        if: steps.guard.outputs.recent == '0'
+        run: |
+          now=$(date -u +%s); next=$(( (now / 900 + 1) * 900 )); wait=$(( next - now - 20 )); [ $wait -lt 0 ] && wait=0
+          echo "sleeping $wait s"; sleep $wait
+          gh workflow run track.yml -R "$REPO"
